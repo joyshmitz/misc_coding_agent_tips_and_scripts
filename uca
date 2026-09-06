@@ -330,6 +330,50 @@ binary_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo ""
 }
 
+# version_lt A B — true when version A orders strictly below version B.
+# Dotted numeric cores compare numerically per component (1.2.10 > 1.2.9,
+# 0.153.4 > 0.153.2); a pre-release sorts below its release; build metadata
+# (+...) is ignored. Anything that is not a dotted number is unordered and
+# compares as "not less", so callers never act on garbage.
+version_lt() {
+  local a="${1%%+*}" b="${2%%+*}"
+  local a_core="${a%%-*}" b_core="${b%%-*}" a_pre="" b_pre=""
+  [[ "$a" == *-* ]] && a_pre="${a#*-}"
+  [[ "$b" == *-* ]] && b_pre="${b#*-}"
+  [[ "$a_core" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  [[ "$b_core" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  local -a pa pb
+  IFS=. read -r -a pa <<< "$a_core"
+  IFS=. read -r -a pb <<< "$b_core"
+  local i n=${#pa[@]} x y
+  [ "${#pb[@]}" -gt "$n" ] && n=${#pb[@]}
+  for ((i = 0; i < n; i++)); do
+    x=$((10#${pa[i]:-0})); y=$((10#${pb[i]:-0}))
+    [ "$x" -lt "$y" ] && return 0
+    [ "$x" -gt "$y" ] && return 1
+  done
+  [ -n "$a_pre" ] && [ -z "$b_pre" ] && return 0
+  [ -z "$a_pre" ] && [ -n "$b_pre" ] && return 1
+  [ -n "$a_pre" ] && [ -n "$b_pre" ] && [[ "$a_pre" < "$b_pre" ]] && return 0
+  return 1
+}
+
+# The registry's current `latest` dist-tag for @openai/codex, read through the
+# package manager that owns the install (so a custom registry in npmrc/bunfig
+# is honoured). Neither `npm view` nor `bun info` is subject to release-age
+# gating, so this is the real tag even when the install path is gated.
+# Prints nothing when the lookup fails or returns something that is not a
+# version.
+codex_registry_latest() {
+  local owner="$1" out=""
+  case "$owner" in
+    npm) command -v npm &>/dev/null && out=$(npm view @openai/codex dist-tags.latest 2>/dev/null || true) ;;
+    bun) command -v bun &>/dev/null && out=$(bun info @openai/codex dist-tags.latest 2>/dev/null || true) ;;
+  esac
+  out=$(grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?(-[a-zA-Z0-9.]+)?' <<< "$out" | head -1)
+  [ -n "$out" ] && echo "$out"
+}
+
 update_codex() {
   CODEX_UPDATE_WARNING=""
   local bin real owner ver_before ver_after mtime_before mtime_after ret=0
@@ -342,11 +386,33 @@ update_codex() {
   ver_before=$("$bin" --version 2>/dev/null || true)
   mtime_before=$(binary_mtime "$real")
 
+  # Never downgrade through a package manager. Both npm (`min-release-age`
+  # in npmrc, npm >= 11) and bun (`minimumReleaseAge` in bunfig.toml) can be
+  # configured to ignore versions published within the last N days. An
+  # `@latest` install under that gate does not fail — it quietly resolves to
+  # the newest version that is OLD enough, which can be older than what is
+  # already installed (0.153.2 -> 0.151.0 was reported). A stale cached
+  # packument produces the same result. So: read the ungated registry tag
+  # first and refuse to move backwards, then install with the age gate and
+  # the cache staleness check overridden for this one package. npm and bun
+  # releases that predate these flags accept them (a warning at most).
+  local installed latest
+  installed=$(extract_clean_version "$ver_before")
+  case "$owner" in
+    bun|npm)
+      latest=$(codex_registry_latest "$owner")
+      if [ -n "$latest" ] && [ -n "$installed" ] && version_lt "$latest" "$installed"; then
+        CODEX_UPDATE_WARNING="Registry 'latest' for @openai/codex is $latest, older than the installed $installed — leaving the $owner install alone rather than downgrading."
+        return 0
+      fi
+      ;;
+  esac
+
   case "$owner" in
     bun)
-      bun install -g @openai/codex@latest 2>&1 || ret=$? ;;
+      bun install -g @openai/codex@latest --minimum-release-age=0 --no-cache 2>&1 || ret=$? ;;
     npm)
-      npm install -g @openai/codex@latest 2>&1 || ret=$? ;;
+      npm install -g @openai/codex@latest --prefer-online --min-release-age=0 2>&1 || ret=$? ;;
     standalone|*)
       # Standalone installer (or unknown ownership): use codex's own
       # updater rather than guessing a package manager.
@@ -363,8 +429,13 @@ update_codex() {
   ver_after=$("$active" --version 2>/dev/null || true)
   mtime_after=$(binary_mtime "$real")
 
+  local after
+  after=$(extract_clean_version "$ver_after")
   if [ "$active_real" != "$real" ]; then
     CODEX_UPDATE_WARNING="Updated codex at $bin ($owner), but 'codex' on PATH resolves to $active — the updated install may be shadowed by an earlier-PATH binary."
+  elif [ -n "$after" ] && [ -n "$installed" ] && version_lt "$after" "$installed"; then
+    CODEX_UPDATE_WARNING="codex went from $installed to $after ($owner) — a DOWNGRADE. '@latest' is probably being resolved through a release-age gate (npm min-release-age / bun minimumReleaseAge) or a stale registry cache; check '$owner' config and reinstall $installed by hand."
+    return 1
   elif [ "$ver_after" = "$ver_before" ] && [ -n "$mtime_before" ] && [ "$mtime_after" = "$mtime_before" ]; then
     : # untouched binary: already up to date (normal) — caller reports version status
   fi
@@ -886,7 +957,23 @@ run_all_updates() {
       omp)    V_OMP="$v_after";    ST_OMP="up_to_date" ;;
     esac
 
-    if [ -n "$v_before" ] && [ -n "$v_after" ] && [ "$v_before" != "$v_after" ]; then
+    # A version that moved backwards is not an update: the harness's own
+    # updater or its package manager handed us an older release (see
+    # update_codex for the release-age-gate case). Report it as a failure,
+    # never as "UPDATED", and never notify "Upgraded" for it.
+    if [ -n "$v_before" ] && [ -n "$v_after" ] && version_lt "$v_after" "$v_before"; then
+      has_errors=1
+      case "$h" in
+        claude) ST_CLAUDE="error" ;;
+        codex)  ST_CODEX="error" ;;
+        agy)    ST_AGY="error" ;;
+        grok)   ST_GROK="error" ;;
+        omp)    ST_OMP="error" ;;
+      esac
+      if [ "$quiet" -eq 0 ]; then
+        echo -e "\r  ${C_YELLOW}⚠️${C_RESET} $(pad_str "${C_BOLD}${h_name}${C_RESET}" 20) ${C_BOLD}${C_YELLOW}DOWNGRADED${C_RESET}: From version ${C_YELLOW}${v_before}${C_RESET} to version ${C_YELLOW}${v_after}${C_RESET} (${h_dur}s)"
+      fi
+    elif [ -n "$v_before" ] && [ -n "$v_after" ] && [ "$v_before" != "$v_after" ]; then
       any_updated=1
       mru_key="$h_name"
       mru_from="$v_before"

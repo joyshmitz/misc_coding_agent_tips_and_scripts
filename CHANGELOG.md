@@ -20,6 +20,16 @@ A tool for managing updates and version telemetry across five AI coding agent ha
 - Add `uninstall-uca.sh` (dedicated standalone uninstaller with Gum confirmation and service teardown)
 - Add `UNIVERSAL_CODING_AGENT_HARNESS_UPDATER.md` (comprehensive documentation guide)
 
+**Fixes** (2026-09-06):
+- `uca codex` could downgrade an npm- or bun-owned install and then report it as an update
+  (`UPDATED: From version 0.153.2 to version 0.151.0`). npm 11's `min-release-age` (and bun's
+  `minimumReleaseAge`) make an `@latest` install quietly resolve to the newest version that is old
+  enough, and a stale cached packument does the same. UCA now reads the ungated registry `latest`
+  first and refuses to move backwards, installs with the age gate and cache staleness overridden for
+  that one package (`--prefer-online --min-release-age=0` / `--minimum-release-age=0 --no-cache`),
+  and the update loop reports any harness whose version went backwards as `DOWNGRADED` (run fails,
+  no "Upgraded" notification). Regression test: `tests/test-uca-codex-registry.sh` (#11)
+
 **Fixes** (2026-09-02):
 - `install-uca.sh` / `uninstall-uca.sh` aborted in any interactive terminal that had gum installed
   (`gum: error: unknown flag ->`, then `exec: "install_uca_script": executable file not found`).

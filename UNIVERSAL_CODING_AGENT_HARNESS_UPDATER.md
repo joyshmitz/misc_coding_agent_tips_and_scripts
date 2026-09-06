@@ -34,6 +34,8 @@ cd misc_coding_agent_tips_and_scripts
 | **xAI Grok** | `~/.grok/bin/grok` | `grok update` |
 | **OMP** | `~/.bun/bin/omp` | `omp update` |
 
+For the package-manager-owned Codex paths, UCA never downgrades. npm (`min-release-age` in `.npmrc`, npm 11+) and bun (`minimumReleaseAge` in `bunfig.toml`) can be configured to ignore versions published within the last N days; under such a gate an `@latest` install does not fail, it quietly resolves to the newest version that is old enough, which can be older than what is installed. UCA therefore reads the registry's real `latest` tag first (`npm view` / `bun info` are not gated) and skips the update with a note if that tag is behind the installed version, then installs with the gate and the cached-packument staleness check overridden for that one package (`--prefer-online --min-release-age=0` for npm, `--minimum-release-age=0 --no-cache` for bun). If a harness still comes back older than it was, the run reports `DOWNGRADED` and fails instead of announcing an update.
+
 ---
 
 ## Command Reference
